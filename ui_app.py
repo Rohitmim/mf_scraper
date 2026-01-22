@@ -697,8 +697,8 @@ def main():
                                     # Estimate current NAV from holdings
                                     with col_nav2:
                                         try:
-                                            scraper = HoldingsScraper()
-                                            estimate = scraper.estimate_nav_change(scheme_code, clean_name, last_nav)
+                                            scraper = HoldingsScraper(db_client=db_nav.client)
+                                            estimate = scraper.estimate_nav_change(scheme_code, clean_name, last_nav, fund_id=fund_id)
                                             if estimate:
                                                 est_nav = estimate['estimated_nav']
                                                 change_pct = estimate['change_percent']

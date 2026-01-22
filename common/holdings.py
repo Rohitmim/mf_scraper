@@ -1,28 +1,96 @@
 """
 Holdings Scraper - Fetches mutual fund holdings and estimates current NAV
 Sources: Value Research, stock prices from Yahoo Finance
+Database caching: Holdings stored in DB, reused if same day
 """
 
 import requests
 from bs4 import BeautifulSoup
 import yfinance as yf
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import re
 
 
 class HoldingsScraper:
     """Scrape fund holdings and calculate estimated NAV"""
 
-    def __init__(self):
+    def __init__(self, db_client=None):
+        """
+        Initialize scraper with optional database client for persistent caching.
+
+        Args:
+            db_client: Supabase client for database operations. If None, uses memory cache only.
+        """
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
         })
+        self.db = db_client
         # Cache for stock prices (symbol -> {price, timestamp})
         self._price_cache: Dict[str, dict] = {}
-        # Cache for holdings (scheme_code -> {holdings, timestamp})
+        # In-memory cache for holdings (scheme_code -> {holdings, timestamp})
         self._holdings_cache: Dict[int, dict] = {}
+
+    def _get_holdings_from_db(self, scheme_code: int) -> List[dict]:
+        """Get holdings from database if fetched today"""
+        if not self.db:
+            return []
+
+        try:
+            today = date.today().isoformat()
+            result = self.db.table("fund_holdings").select("*").eq(
+                "scheme_code", scheme_code
+            ).eq("fetch_date", today).execute()
+
+            if result.data:
+                return [
+                    {
+                        'stock_name': r['stock_name'],
+                        'nse_symbol': r['nse_symbol'],
+                        'percentage': float(r['percentage']) if r['percentage'] else 0,
+                        'sector': r['sector'] or ''
+                    }
+                    for r in result.data
+                ]
+        except Exception as e:
+            print(f"DB read error: {e}")
+
+        return []
+
+    def _save_holdings_to_db(self, scheme_code: int, fund_id: Optional[int], holdings: List[dict]) -> bool:
+        """Save holdings to database"""
+        if not self.db or not holdings:
+            return False
+
+        try:
+            today = date.today().isoformat()
+
+            # Delete old entries for this fund/date (in case of re-fetch)
+            self.db.table("fund_holdings").delete().eq(
+                "scheme_code", scheme_code
+            ).eq("fetch_date", today).execute()
+
+            # Insert new holdings
+            rows = [
+                {
+                    'fund_id': fund_id,
+                    'scheme_code': scheme_code,
+                    'fetch_date': today,
+                    'stock_name': h['stock_name'],
+                    'nse_symbol': h.get('nse_symbol', ''),
+                    'percentage': h.get('percentage', 0),
+                    'sector': h.get('sector', '')
+                }
+                for h in holdings
+            ]
+
+            self.db.table("fund_holdings").insert(rows).execute()
+            return True
+        except Exception as e:
+            print(f"DB write error: {e}")
+
+        return False
 
     def get_holdings_from_mfapi(self, scheme_code: int) -> List[dict]:
         """
@@ -98,20 +166,34 @@ class HoldingsScraper:
 
         return holdings[:15]  # Top 15 holdings
 
-    def get_holdings(self, scheme_code: int, fund_name: str) -> List[dict]:
+    def get_holdings(self, scheme_code: int, fund_name: str, fund_id: Optional[int] = None) -> List[dict]:
         """
-        Get holdings for a fund (with caching)
+        Get holdings for a fund (with database + memory caching)
         Returns list of {stock_name, percentage, nse_symbol}
+
+        Cache strategy:
+        1. Check in-memory cache (valid for current session)
+        2. Check database (valid if fetched today)
+        3. Scrape fresh and save to database
         """
-        # Check cache (valid for 24 hours)
+        # 1. Check in-memory cache
         if scheme_code in self._holdings_cache:
             cached = self._holdings_cache[scheme_code]
-            if datetime.now() - cached['timestamp'] < timedelta(hours=24):
+            if datetime.now() - cached['timestamp'] < timedelta(hours=1):
                 return cached['holdings']
 
-        holdings = []
+        # 2. Check database cache (same day)
+        holdings = self._get_holdings_from_db(scheme_code)
+        if holdings:
+            # Update in-memory cache
+            self._holdings_cache[scheme_code] = {
+                'holdings': holdings,
+                'timestamp': datetime.now()
+            }
+            return holdings
 
-        # Try Moneycontrol
+        # 3. Scrape fresh
+        holdings = []
         mc_url = self.search_moneycontrol_fund(fund_name)
         if mc_url:
             holdings = self.get_holdings_from_moneycontrol(mc_url)
@@ -120,8 +202,9 @@ class HoldingsScraper:
         for holding in holdings:
             holding['nse_symbol'] = self._guess_nse_symbol(holding['stock_name'])
 
-        # Cache results
+        # Save to database and memory cache
         if holdings:
+            self._save_holdings_to_db(scheme_code, fund_id, holdings)
             self._holdings_cache[scheme_code] = {
                 'holdings': holdings,
                 'timestamp': datetime.now()
@@ -234,7 +317,7 @@ class HoldingsScraper:
 
         return None
 
-    def estimate_nav_change(self, scheme_code: int, fund_name: str, last_nav: float) -> Optional[dict]:
+    def estimate_nav_change(self, scheme_code: int, fund_name: str, last_nav: float, fund_id: Optional[int] = None) -> Optional[dict]:
         """
         Estimate current NAV based on holdings and stock price changes
 
@@ -245,7 +328,7 @@ class HoldingsScraper:
         - last_nav: float
         - calculation_time: datetime
         """
-        holdings = self.get_holdings(scheme_code, fund_name)
+        holdings = self.get_holdings(scheme_code, fund_name, fund_id=fund_id)
         if not holdings:
             return None
 
