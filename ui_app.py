@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 import subprocess
 import os
 
-from common import SupabaseDB, MFAPIClient
+from common import SupabaseDB, MFAPIClient, HoldingsScraper
 
 # Page config
 st.set_page_config(
@@ -680,11 +680,51 @@ def main():
 
                             if not nav_df.empty:
                                 cutoff = datetime.now() - timedelta(days=days)
-                                nav_df = nav_df[nav_df['date'] >= cutoff]
+                                nav_filtered = nav_df[nav_df['date'] >= cutoff]
 
-                                if not nav_df.empty:
-                                    chart_data = nav_df.set_index('date')['nav']
+                                if not nav_filtered.empty:
+                                    chart_data = nav_filtered.set_index('date')['nav']
                                     st.line_chart(chart_data, height=350)
+
+                                    # Show last NAV and estimated current NAV
+                                    last_nav = nav_df['nav'].iloc[-1]
+                                    last_date = nav_df['date'].iloc[-1].strftime('%d %b %Y')
+
+                                    col_nav1, col_nav2, col_nav3 = st.columns(3)
+                                    with col_nav1:
+                                        st.metric("Last NAV", f"₹{last_nav:.2f}", help=f"As of {last_date}")
+
+                                    # Estimate current NAV from holdings
+                                    with col_nav2:
+                                        try:
+                                            scraper = HoldingsScraper()
+                                            estimate = scraper.estimate_nav_change(scheme_code, clean_name, last_nav)
+                                            if estimate:
+                                                est_nav = estimate['estimated_nav']
+                                                change_pct = estimate['change_percent']
+                                                delta_color = "normal" if change_pct >= 0 else "inverse"
+                                                st.metric(
+                                                    "Est. Current NAV",
+                                                    f"₹{est_nav:.2f}",
+                                                    f"{change_pct:+.2f}%",
+                                                    delta_color=delta_color,
+                                                    help=f"Based on {estimate['holdings_used']} holdings ({estimate['coverage_pct']:.0f}% coverage)"
+                                                )
+                                            else:
+                                                st.metric("Est. Current NAV", "N/A", help="Holdings data not available")
+                                        except Exception as e:
+                                            st.metric("Est. Current NAV", "N/A", help=f"Error: {str(e)[:50]}")
+
+                                    with col_nav3:
+                                        if estimate and estimate.get('holdings'):
+                                            with st.expander("Top Holdings"):
+                                                for h in estimate['holdings'][:5]:
+                                                    change = h.get('change_pct')
+                                                    if change is not None:
+                                                        arrow = "🟢" if change >= 0 else "🔴"
+                                                        st.text(f"{arrow} {h['stock_name'][:20]}: {h['percentage']:.1f}% ({change:+.1f}%)")
+                                                    else:
+                                                        st.text(f"⚪ {h['stock_name'][:20]}: {h['percentage']:.1f}%")
                                 else:
                                     st.warning("No NAV data for selected period")
                             else:
