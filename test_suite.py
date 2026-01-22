@@ -353,14 +353,13 @@ def test_ui():
                 streamlit_proc.terminate()
                 return
 
-            # Wait for data to load - check for sidebar or data table with retries
-            max_wait = 60  # max seconds to wait for data
+            # Wait for data table to load (not just sidebar)
+            max_wait = 90  # max seconds to wait for data
             for i in range(max_wait // 5):
                 time.sleep(5)
-                # Check if loading is complete (sidebar or table visible)
-                sidebar = page.query_selector("section[data-testid='stSidebar']")
+                # Check if data table is visible
                 tables = page.query_selector_all("div[data-testid='stDataFrame']")
-                if sidebar or tables:
+                if tables:
                     break
 
             # Test 2: Check for errors
