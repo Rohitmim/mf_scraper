@@ -264,57 +264,6 @@ def fetch_nav_data(scheme_code: int) -> pd.DataFrame:
         return df
     return pd.DataFrame()
 
-def get_nav_comparison_data(fund_infos: list, days: int = 365, normalize: bool = True) -> pd.DataFrame:
-    """
-    Fetch NAV data for multiple funds.
-
-    Args:
-        fund_infos: List of dicts with 'scheme_code' and 'fund_name'
-        days: Number of days of history to include
-        normalize: If True, normalize to 100 at start (for comparison). If False, show actual NAV.
-
-    Returns:
-        DataFrame with date index and one column per fund
-    """
-    from datetime import datetime, timedelta
-    cutoff_date = datetime.now() - timedelta(days=days)
-
-    all_data = {}
-    for info in fund_infos:
-        scheme_code = info.get('scheme_code')
-        fund_name = info.get('fund_name', f'Fund {scheme_code}')
-
-        if not scheme_code:
-            continue
-
-        nav_df = fetch_nav_data(scheme_code)
-        if nav_df.empty:
-            continue
-
-        # Filter to last N days
-        nav_df = nav_df[nav_df['date'] >= cutoff_date]
-        if nav_df.empty:
-            continue
-
-        # Use short name for legend
-        short_name = fund_name[:40] + '...' if len(fund_name) > 40 else fund_name
-
-        if normalize:
-            # Normalize to 100 at the start
-            first_nav = nav_df['nav'].iloc[0]
-            if first_nav and first_nav > 0:
-                all_data[short_name] = nav_df.set_index('date')['nav'] / first_nav * 100
-        else:
-            # Show actual NAV values
-            all_data[short_name] = nav_df.set_index('date')['nav']
-
-    if not all_data:
-        return pd.DataFrame()
-
-    # Combine all series into one DataFrame
-    result = pd.DataFrame(all_data)
-    return result
-
 def pivot_data(df, nav_data=None, calc_info=None):
     """Pivot data to have dates as columns with summary stats
 
@@ -698,54 +647,48 @@ def main():
                 height=600,
                 hide_index=True,
                 on_select="rerun",
-                selection_mode="multi-row",
+                selection_mode="single-row",
             )
 
-            # Show NAV chart when funds are selected
+            # Show NAV chart when a fund is selected
             if event and event.selection and event.selection.rows:
-                selected_rows = event.selection.rows
+                selected_row = event.selection.rows[0]
+                fund_name = pivot_df.iloc[selected_row]["fund_name"]
+                clean_name = fund_name.replace("⭐ ", "")
 
-                # Gather fund info for selected funds
-                selected_fund_infos = []
-                db_nav = SupabaseDB()
+                # Get scheme_code for selected fund
+                fund_row = df[df["fund_name"] == clean_name]
+                if not fund_row.empty:
+                    fund_id = fund_row.iloc[0].get("fund_id")
+                    if fund_id:
+                        db_nav = SupabaseDB()
+                        fund_info = db_nav.client.table("mutual_funds").select("scheme_code").eq("id", fund_id).execute()
+                        if fund_info.data and fund_info.data[0].get("scheme_code"):
+                            scheme_code = fund_info.data[0]["scheme_code"]
 
-                for row_idx in selected_rows:
-                    fund_name = pivot_df.iloc[row_idx]["fund_name"]
-                    clean_name = fund_name.replace("⭐ ", "")
+                            st.markdown("---")
+                            st.markdown(f"**{clean_name}**")
 
-                    fund_row = df[df["fund_name"] == clean_name]
-                    if not fund_row.empty:
-                        fund_id = fund_row.iloc[0].get("fund_id")
-                        if fund_id:
-                            fund_info = db_nav.client.table("mutual_funds").select("scheme_code").eq("id", fund_id).execute()
-                            if fund_info.data and fund_info.data[0].get("scheme_code"):
-                                selected_fund_infos.append({
-                                    "scheme_code": fund_info.data[0]["scheme_code"],
-                                    "fund_name": clean_name
-                                })
+                            col1, col2 = st.columns([1, 5])
+                            with col1:
+                                period = st.selectbox("Period", ["1Y", "6M", "2Y", "3Y"], index=0, key="nav_period")
+                                days_map = {"6M": 180, "1Y": 365, "2Y": 730, "3Y": 1095}
+                                days = days_map.get(period, 365)
 
-                # Show NAV chart
-                if selected_fund_infos:
-                    st.markdown("---")
+                            with st.spinner("Loading NAV..."):
+                                nav_df = fetch_nav_data(scheme_code)
 
-                    col1, col2 = st.columns([1, 5])
-                    with col1:
-                        period = st.selectbox("Period", ["1Y", "6M", "2Y", "3Y"], index=0, key="nav_period")
-                        days_map = {"6M": 180, "1Y": 365, "2Y": 730, "3Y": 1095}
-                        days = days_map.get(period, 365)
+                            if not nav_df.empty:
+                                cutoff = datetime.now() - timedelta(days=days)
+                                nav_df = nav_df[nav_df['date'] >= cutoff]
 
-                    # Single fund: show actual NAV, Multiple funds: normalize for comparison
-                    is_single = len(selected_fund_infos) == 1
-
-                    with st.spinner("Loading NAV..."):
-                        nav_data = get_nav_comparison_data(selected_fund_infos, days=days, normalize=not is_single)
-
-                    if not nav_data.empty:
-                        st.line_chart(nav_data, height=350)
-                        if not is_single:
-                            st.caption("NAV normalized to 100 at start for comparison")
-                    else:
-                        st.warning("Could not fetch NAV data")
+                                if not nav_df.empty:
+                                    chart_data = nav_df.set_index('date')['nav']
+                                    st.line_chart(chart_data, height=350)
+                                else:
+                                    st.warning("No NAV data for selected period")
+                            else:
+                                st.warning("Could not fetch NAV data")
 
             # Download button
             csv = pivot_df.to_csv(index=False)
