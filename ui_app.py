@@ -264,16 +264,17 @@ def fetch_nav_data(scheme_code: int) -> pd.DataFrame:
         return df
     return pd.DataFrame()
 
-def get_nav_comparison_data(fund_infos: list, days: int = 365) -> pd.DataFrame:
+def get_nav_comparison_data(fund_infos: list, days: int = 365, normalize: bool = True) -> pd.DataFrame:
     """
-    Fetch and normalize NAV data for multiple funds for comparison.
+    Fetch NAV data for multiple funds.
 
     Args:
         fund_infos: List of dicts with 'scheme_code' and 'fund_name'
         days: Number of days of history to include
+        normalize: If True, normalize to 100 at start (for comparison). If False, show actual NAV.
 
     Returns:
-        DataFrame with date index and one column per fund (normalized to 100 at start)
+        DataFrame with date index and one column per fund
     """
     from datetime import datetime, timedelta
     cutoff_date = datetime.now() - timedelta(days=days)
@@ -295,13 +296,17 @@ def get_nav_comparison_data(fund_infos: list, days: int = 365) -> pd.DataFrame:
         if nav_df.empty:
             continue
 
-        # Normalize to 100 at the start
-        first_nav = nav_df['nav'].iloc[0]
-        if first_nav and first_nav > 0:
-            nav_df['normalized'] = (nav_df['nav'] / first_nav) * 100
-            # Use short name for legend
-            short_name = fund_name[:40] + '...' if len(fund_name) > 40 else fund_name
-            all_data[short_name] = nav_df.set_index('date')['normalized']
+        # Use short name for legend
+        short_name = fund_name[:40] + '...' if len(fund_name) > 40 else fund_name
+
+        if normalize:
+            # Normalize to 100 at the start
+            first_nav = nav_df['nav'].iloc[0]
+            if first_nav and first_nav > 0:
+                all_data[short_name] = nav_df.set_index('date')['nav'] / first_nav * 100
+        else:
+            # Show actual NAV values
+            all_data[short_name] = nav_df.set_index('date')['nav']
 
     if not all_data:
         return pd.DataFrame()
@@ -729,11 +734,16 @@ def main():
                         days_map = {"6M": 180, "1Y": 365, "2Y": 730, "3Y": 1095}
                         days = days_map.get(period, 365)
 
+                    # Single fund: show actual NAV, Multiple funds: normalize for comparison
+                    is_single = len(selected_fund_infos) == 1
+
                     with st.spinner("Loading NAV..."):
-                        nav_data = get_nav_comparison_data(selected_fund_infos, days=days)
+                        nav_data = get_nav_comparison_data(selected_fund_infos, days=days, normalize=not is_single)
 
                     if not nav_data.empty:
                         st.line_chart(nav_data, height=350)
+                        if not is_single:
+                            st.caption("NAV normalized to 100 at start for comparison")
                     else:
                         st.warning("Could not fetch NAV data")
 
