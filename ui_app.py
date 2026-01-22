@@ -683,37 +683,52 @@ def main():
                                 nav_filtered = nav_df[nav_df['date'] >= cutoff]
 
                                 if not nav_filtered.empty:
-                                    chart_data = nav_filtered.set_index('date')['nav']
-                                    st.line_chart(chart_data, height=350)
-
-                                    # Show last NAV and estimated current NAV
+                                    # Get last NAV and estimate current
                                     last_nav = nav_df['nav'].iloc[-1]
-                                    last_date = nav_df['date'].iloc[-1].strftime('%d %b %Y')
+                                    last_date = nav_df['date'].iloc[-1]
 
+                                    # Calculate estimated NAV first
+                                    estimate = None
+                                    try:
+                                        scraper = HoldingsScraper(db_client=db_nav.client)
+                                        estimate = scraper.estimate_nav_change(scheme_code, clean_name, last_nav, fund_id=fund_id)
+                                    except Exception:
+                                        pass
+
+                                    # Build chart data with estimated current value
+                                    chart_df = nav_filtered[['date', 'nav']].copy()
+                                    chart_df = chart_df.rename(columns={'nav': 'Historical NAV'})
+
+                                    if estimate:
+                                        est_nav = estimate['estimated_nav']
+                                        # Add estimated NAV as today's point
+                                        today = pd.Timestamp(datetime.now().date())
+                                        est_row = pd.DataFrame({'date': [today], 'Est. Current': [est_nav]})
+                                        chart_df['Est. Current'] = None
+                                        chart_df = pd.concat([chart_df, est_row], ignore_index=True)
+
+                                    chart_df = chart_df.set_index('date')
+                                    st.line_chart(chart_df, height=350)
+
+                                    # Show metrics
                                     col_nav1, col_nav2, col_nav3 = st.columns(3)
                                     with col_nav1:
-                                        st.metric("Last NAV", f"₹{last_nav:.2f}", help=f"As of {last_date}")
+                                        st.metric("Last NAV", f"₹{last_nav:.2f}", help=f"As of {last_date.strftime('%d %b %Y')}")
 
-                                    # Estimate current NAV from holdings
                                     with col_nav2:
-                                        try:
-                                            scraper = HoldingsScraper(db_client=db_nav.client)
-                                            estimate = scraper.estimate_nav_change(scheme_code, clean_name, last_nav, fund_id=fund_id)
-                                            if estimate:
-                                                est_nav = estimate['estimated_nav']
-                                                change_pct = estimate['change_percent']
-                                                delta_color = "normal" if change_pct >= 0 else "inverse"
-                                                st.metric(
-                                                    "Est. Current NAV",
-                                                    f"₹{est_nav:.2f}",
-                                                    f"{change_pct:+.2f}%",
-                                                    delta_color=delta_color,
-                                                    help=f"Based on {estimate['holdings_used']} holdings ({estimate['coverage_pct']:.0f}% coverage)"
-                                                )
-                                            else:
-                                                st.metric("Est. Current NAV", "N/A", help="Holdings data not available")
-                                        except Exception as e:
-                                            st.metric("Est. Current NAV", "N/A", help=f"Error: {str(e)[:50]}")
+                                        if estimate:
+                                            est_nav = estimate['estimated_nav']
+                                            change_pct = estimate['change_percent']
+                                            delta_color = "normal" if change_pct >= 0 else "inverse"
+                                            st.metric(
+                                                "Est. Current NAV",
+                                                f"₹{est_nav:.2f}",
+                                                f"{change_pct:+.2f}%",
+                                                delta_color=delta_color,
+                                                help=f"Based on {estimate['holdings_used']} holdings ({estimate['coverage_pct']:.0f}% coverage)"
+                                            )
+                                        else:
+                                            st.metric("Est. Current NAV", "N/A", help="Holdings data not available")
 
                                     with col_nav3:
                                         if estimate and estimate.get('holdings'):
