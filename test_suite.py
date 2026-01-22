@@ -6,7 +6,25 @@ Run: python test_suite.py
 
 import sys
 import time
+import os
+import subprocess
+import signal
 from datetime import datetime
+
+
+def load_env_file(env_path=".env"):
+    """Load environment variables from .env file"""
+    env = os.environ.copy()
+    if os.path.exists(env_path):
+        with open(env_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    # Strip quotes if present
+                    value = value.strip().strip('"').strip("'")
+                    env[key.strip()] = value
+    return env
 
 # Test results tracking
 results = {"passed": 0, "failed": 0, "errors": []}
@@ -297,6 +315,28 @@ def test_ui():
         test_failed("Playwright import", "playwright not installed")
         return
 
+    # Start Streamlit with env vars loaded
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(script_dir, ".env")
+
+    # Kill any existing Streamlit processes on port 8501
+    subprocess.run("pkill -f 'streamlit run ui_app.py' 2>/dev/null; lsof -ti:8501 | xargs kill -9 2>/dev/null",
+                   shell=True, capture_output=True)
+    time.sleep(2)
+
+    # Start Streamlit using shell to source env file directly
+    streamlit_cmd = f"set -a && source {env_path} && set +a && python3 -m streamlit run ui_app.py --server.headless=true --server.port=8501"
+    streamlit_proc = subprocess.Popen(
+        streamlit_cmd,
+        shell=True,
+        cwd=script_dir,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+    # Wait for Streamlit to start
+    time.sleep(8)
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -310,9 +350,18 @@ def test_ui():
             except Exception as e:
                 test_failed("Page load", str(e))
                 browser.close()
+                streamlit_proc.terminate()
                 return
 
-            time.sleep(10)  # Wait for data
+            # Wait for data to load - check for sidebar or data table with retries
+            max_wait = 60  # max seconds to wait for data
+            for i in range(max_wait // 5):
+                time.sleep(5)
+                # Check if loading is complete (sidebar or table visible)
+                sidebar = page.query_selector("section[data-testid='stSidebar']")
+                tables = page.query_selector_all("div[data-testid='stDataFrame']")
+                if sidebar or tables:
+                    break
 
             # Test 2: Check for errors
             error_elements = page.query_selector_all("div[data-testid='stException']")
@@ -358,6 +407,13 @@ def test_ui():
 
     except Exception as e:
         test_failed("UI test", str(e))
+    finally:
+        # Stop Streamlit
+        streamlit_proc.terminate()
+        try:
+            streamlit_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            streamlit_proc.kill()
 
 
 # ==================== CALCULATION TESTS ====================
