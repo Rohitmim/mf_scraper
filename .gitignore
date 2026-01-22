@@ -1,0 +1,36 @@
+# Environment variables (contains secrets)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test screenshots (large files)
+*.png
+
+# Logs
+logs/
+
+# Cache
+.cache/
+
+# Claude settings (local)
+.claude/
+
+# MacOS
+.DS_Store
+
+# Excel exports
+*.xlsx
