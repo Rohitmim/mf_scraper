@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 import subprocess
 import os
 
-from common import SupabaseDB
+from common import SupabaseDB, MFAPIClient
 
 # Page config
 st.set_page_config(
@@ -249,6 +249,66 @@ def load_market_changes():
     db = SupabaseDB()
     changes = db.get_significant_changes(index_name="SENSEX")
     return pd.DataFrame(changes)
+
+@st.cache_data(ttl=600)
+def fetch_nav_data(scheme_code: int) -> pd.DataFrame:
+    """Fetch NAV data for a fund from MFAPI"""
+    mfapi = MFAPIClient(cache_max_age_hours=24)
+    data = mfapi.get_fund_nav(scheme_code)
+    if data and data.get('data'):
+        nav_list = data['data']
+        df = pd.DataFrame(nav_list)
+        df['nav'] = pd.to_numeric(df['nav'], errors='coerce')
+        df['date'] = pd.to_datetime(df['date'], format='%d-%m-%Y')
+        df = df.sort_values('date')
+        return df
+    return pd.DataFrame()
+
+def get_nav_comparison_data(fund_infos: list, days: int = 365) -> pd.DataFrame:
+    """
+    Fetch and normalize NAV data for multiple funds for comparison.
+
+    Args:
+        fund_infos: List of dicts with 'scheme_code' and 'fund_name'
+        days: Number of days of history to include
+
+    Returns:
+        DataFrame with date index and one column per fund (normalized to 100 at start)
+    """
+    from datetime import datetime, timedelta
+    cutoff_date = datetime.now() - timedelta(days=days)
+
+    all_data = {}
+    for info in fund_infos:
+        scheme_code = info.get('scheme_code')
+        fund_name = info.get('fund_name', f'Fund {scheme_code}')
+
+        if not scheme_code:
+            continue
+
+        nav_df = fetch_nav_data(scheme_code)
+        if nav_df.empty:
+            continue
+
+        # Filter to last N days
+        nav_df = nav_df[nav_df['date'] >= cutoff_date]
+        if nav_df.empty:
+            continue
+
+        # Normalize to 100 at the start
+        first_nav = nav_df['nav'].iloc[0]
+        if first_nav and first_nav > 0:
+            nav_df['normalized'] = (nav_df['nav'] / first_nav) * 100
+            # Use short name for legend
+            short_name = fund_name[:40] + '...' if len(fund_name) > 40 else fund_name
+            all_data[short_name] = nav_df.set_index('date')['normalized']
+
+    if not all_data:
+        return pd.DataFrame()
+
+    # Combine all series into one DataFrame
+    result = pd.DataFrame(all_data)
+    return result
 
 def pivot_data(df, nav_data=None, calc_info=None):
     """Pivot data to have dates as columns with summary stats
@@ -625,7 +685,7 @@ def main():
                 "Multiplier": st.column_config.NumberColumn("Mult", format="%d%%", width="small", help="Multiplier = DipMax × Count% / 100"),
             }
 
-            # Dataframe with row selection
+            # Dataframe with multi-row selection
             event = st.dataframe(
                 pivot_df,
                 column_config=column_config,
@@ -633,62 +693,109 @@ def main():
                 height=600,
                 hide_index=True,
                 on_select="rerun",
-                selection_mode="single-row",
+                selection_mode="multi-row",
             )
 
-            # Show details in bottom panel when a row is selected
+            # Show NAV comparison chart when funds are selected
             if event and event.selection and event.selection.rows:
-                selected_row = event.selection.rows[0]
-                selected_fund_name = pivot_df.iloc[selected_row]["fund_name"]
-                # Remove ⭐ prefix if present for lookup
-                clean_fund_name = selected_fund_name.replace("⭐ ", "")
+                selected_rows = event.selection.rows
 
                 st.markdown("---")
-                st.markdown(f"### 📈 {selected_fund_name}")
+                st.markdown(f"### 📈 NAV Comparison ({len(selected_rows)} funds selected)")
 
-                fund_data = df[df["fund_name"] == clean_fund_name].sort_values("report_date")
+                # Gather fund info for selected funds
+                selected_fund_infos = []
+                db_nav = SupabaseDB()
 
-                if not fund_data.empty:
-                    # Get scheme code for external links
-                    fund_id = fund_data.iloc[0].get("fund_id") if "fund_id" in fund_data.columns else None
-                    scheme_code = None
-                    if fund_id:
-                        db_detail = SupabaseDB()
-                        fund_info = db_detail.client.table("mutual_funds").select("scheme_code").eq("id", fund_id).execute()
-                        if fund_info.data:
-                            scheme_code = fund_info.data[0].get("scheme_code")
+                for row_idx in selected_rows:
+                    fund_name = pivot_df.iloc[row_idx]["fund_name"]
+                    clean_name = fund_name.replace("⭐ ", "")
 
-                    col1, col2, col3 = st.columns([1, 2, 1])
+                    # Get fund_id from the original df
+                    fund_row = df[df["fund_name"] == clean_name]
+                    if not fund_row.empty:
+                        fund_id = fund_row.iloc[0].get("fund_id")
+                        if fund_id:
+                            # Get scheme_code from database
+                            fund_info = db_nav.client.table("mutual_funds").select("scheme_code").eq("id", fund_id).execute()
+                            if fund_info.data and fund_info.data[0].get("scheme_code"):
+                                selected_fund_infos.append({
+                                    "scheme_code": fund_info.data[0]["scheme_code"],
+                                    "fund_name": clean_name
+                                })
 
+                if selected_fund_infos:
+                    # Time period selector
+                    col1, col2 = st.columns([1, 4])
                     with col1:
-                        st.markdown(f"**Category:** {fund_data.iloc[0]['category']}")
-                        st.metric("Latest 3Y ROI", f"{fund_data.iloc[-1]['roi_3y']:.1f}%")
-                        st.metric("Min ROI (6M)", f"{fund_data['roi_3y'].min():.1f}%")
-                        st.metric("Max ROI (6M)", f"{fund_data['roi_3y'].max():.1f}%")
+                        period = st.selectbox("Period", ["1Y", "2Y", "3Y", "6M"], index=0)
+                        days_map = {"6M": 180, "1Y": 365, "2Y": 730, "3Y": 1095}
+                        days = days_map.get(period, 365)
 
-                        # External links
-                        if scheme_code:
-                            st.markdown("**Links:**")
-                            st.markdown(f"[MFAPI NAV](https://api.mfapi.in/mf/{scheme_code})")
-                            st.markdown(f"[Value Research](https://www.valueresearchonline.com/funds/)")
-                            st.markdown(f"[Moneycontrol](https://www.moneycontrol.com/mutual-funds/)")
+                    # Fetch and plot NAV comparison
+                    with st.spinner("Fetching NAV data..."):
+                        nav_comparison = get_nav_comparison_data(selected_fund_infos, days=days)
 
-                    with col2:
-                        st.markdown("**3-Year ROI % Trend**")
-                        chart_data = fund_data[["report_date", "roi_3y"]].set_index("report_date")
-                        st.line_chart(chart_data["roi_3y"], height=250)
-
-                    with col3:
-                        st.markdown("**Holdings Info**")
-                        st.info("Holdings data not available in current version. Check Value Research or Moneycontrol for detailed holdings.")
-
-                        # Historical data table
-                        st.markdown("**Recent Data**")
-                        display_data = fund_data[["report_date", "roi_3y", "scaled_roi"]].tail(10).copy()
-                        display_data.columns = ["Date", "3Y ROI%", "Scaled%"]
-                        st.dataframe(display_data, use_container_width=True, height=200, hide_index=True)
+                    if not nav_comparison.empty:
+                        st.line_chart(nav_comparison, height=400)
+                        st.caption("NAV normalized to 100 at start of period for comparison")
+                    else:
+                        st.warning("Could not fetch NAV data for selected funds")
                 else:
-                    st.warning("No data found for this fund.")
+                    st.warning("No scheme codes found for selected funds")
+
+                # Show single fund detail if only one selected
+                if len(selected_rows) == 1:
+                    selected_row = selected_rows[0]
+                    selected_fund_name = pivot_df.iloc[selected_row]["fund_name"]
+                    clean_fund_name = selected_fund_name.replace("⭐ ", "")
+
+                    st.markdown("---")
+                    st.markdown(f"#### Fund Details: {selected_fund_name}")
+
+                    fund_data = df[df["fund_name"] == clean_fund_name].sort_values("report_date")
+
+                    if not fund_data.empty:
+                        # Get scheme code for external links
+                        fund_id = fund_data.iloc[0].get("fund_id") if "fund_id" in fund_data.columns else None
+                        scheme_code = None
+                        if fund_id:
+                            db_detail = SupabaseDB()
+                            fund_info = db_detail.client.table("mutual_funds").select("scheme_code").eq("id", fund_id).execute()
+                            if fund_info.data:
+                                scheme_code = fund_info.data[0].get("scheme_code")
+
+                        col1, col2, col3 = st.columns([1, 2, 1])
+
+                        with col1:
+                            st.markdown(f"**Category:** {fund_data.iloc[0]['category']}")
+                            st.metric("Latest 3Y ROI", f"{fund_data.iloc[-1]['roi_3y']:.1f}%")
+                            st.metric("Min ROI (6M)", f"{fund_data['roi_3y'].min():.1f}%")
+                            st.metric("Max ROI (6M)", f"{fund_data['roi_3y'].max():.1f}%")
+
+                            # External links
+                            if scheme_code:
+                                st.markdown("**Links:**")
+                                st.markdown(f"[MFAPI NAV](https://api.mfapi.in/mf/{scheme_code})")
+                                st.markdown(f"[Value Research](https://www.valueresearchonline.com/funds/)")
+                                st.markdown(f"[Moneycontrol](https://www.moneycontrol.com/mutual-funds/)")
+
+                        with col2:
+                            st.markdown("**3-Year ROI % Trend**")
+                            chart_data = fund_data[["report_date", "roi_3y"]].set_index("report_date")
+                            st.line_chart(chart_data["roi_3y"], height=250)
+
+                        with col3:
+                            st.markdown("**Holdings Info**")
+                            st.info("Holdings data not available in current version. Check Value Research or Moneycontrol for detailed holdings.")
+
+                            # Historical data table
+                            st.markdown("**Recent Data**")
+                            display_data = fund_data[["report_date", "roi_3y", "scaled_roi"]].tail(10).copy()
+                            display_data.columns = ["Date", "3Y ROI%", "Scaled%"]
+                            st.dataframe(display_data, use_container_width=True, height=200, hide_index=True)
+                    else:
+                        st.warning("No data found for this fund.")
 
             # Download button
             csv = pivot_df.to_csv(index=False)
